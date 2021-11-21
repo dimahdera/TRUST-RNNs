@@ -1,0 +1,1003 @@
+import tensorflow as tf
+from tensorflow import keras
+import os
+#os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# For multiple devices (GPUs: 4, 5, 6, 7)
+#os.environ["CUDA_VISIBLE_DEVICES"] = "1, 4, 5, 6"
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+import math
+import time, sys
+import pickle
+import timeit
+import datetime 
+import matplotlib as mpl
+import wandb
+os.environ["WANDB_API_KEY"] = "9deddc5ad75843b983c3f21d0a5ace861e19133a"
+import xlsxwriter
+import pandas as pd
+plt.ioff()
+
+# update_progress() : Displays or updates a console progress bar
+## Accepts a float between 0 and 1. Any int will be converted to a float.
+## A value under 0 represents a 'halt'.
+## A value at 1 or bigger represents 100%
+def update_progress(progress):
+    barLength = 10 # Modify this to change the length of the progress bar
+    status = ""
+    if isinstance(progress, int):
+        progress = float(progress)
+    if not isinstance(progress, float):
+        progress = 0
+        status = "error: progress var must be float\r\n"
+    if progress < 0:
+        progress = 0
+        status = "Halt...\r\n"
+    if progress >= 1:
+        progress = 1
+        status = "Done...\r\n"
+    block = int(round(barLength*progress))
+    text = "\rPercent: [{0}] {1}% {2}".format( "#"*block + "-"*(barLength-block), progress*100, status)
+    sys.stdout.write(text)
+    sys.stdout.flush()
+
+def x_Sigma_w_x_T(x, W_Sigma):
+  batch_sz = x.shape[0]
+  xx_t = tf.reduce_sum(tf.multiply(x, x),axis=1, keepdims=True)               
+  xx_t_e = tf.expand_dims(xx_t,axis=2)                                      
+  return tf.multiply(xx_t_e, W_Sigma)
+
+def w_t_Sigma_i_w(w_mu, in_Sigma):
+  Sigma_1_1 = tf.matmul(tf.transpose(w_mu), in_Sigma)
+  Sigma_1_2 = tf.matmul(Sigma_1_1, w_mu)
+  return Sigma_1_2
+
+def tr_Sigma_w_Sigma_in(in_Sigma, W_Sigma):
+  Sigma_3_1 = tf.linalg.trace(in_Sigma)
+  Sigma_3_2 = tf.expand_dims(Sigma_3_1, axis=1)
+  Sigma_3_3 = tf.expand_dims(Sigma_3_2, axis=1)
+  return tf.multiply(Sigma_3_3, W_Sigma) 
+
+def activation_Sigma(gradi, Sigma_in):
+  grad1 = tf.expand_dims(gradi,axis=2)
+  grad2 = tf.expand_dims(gradi,axis=1)
+  return tf.multiply(Sigma_in, tf.matmul(grad1, grad2))
+
+
+def Hadamard_sigma(sigma1, sigma2, mu1, mu2):
+  sigma_1 = tf.multiply(sigma1, sigma2)
+  sigma_2 = tf.matmul(tf.matmul(tf.linalg.diag(mu1) ,   sigma2),   tf.linalg.diag(mu1))
+  sigma_3 = tf.matmul(tf.matmul(tf.linalg.diag(mu2) ,   sigma1),   tf.linalg.diag(mu2))
+  return sigma_1 + sigma_2 + sigma_3
+
+def grad_sigmoid(mu_in):
+  with tf.GradientTape() as g:
+    g.watch(mu_in)
+    out = tf.sigmoid(mu_in)
+  gradi = g.gradient(out, mu_in) 
+  return gradi
+
+def grad_tanh(mu_in):
+  with tf.GradientTape() as g:
+    g.watch(mu_in)
+    out = tf.tanh(mu_in)
+  gradi = g.gradient(out, mu_in) 
+  return gradi
+
+def mu_muT(mu1, mu2):
+  mu11 = tf.expand_dims(mu1,axis=2)
+  mu22 = tf.expand_dims(mu2,axis=1)
+  return tf.matmul(mu11, mu22)
+
+
+#def sigma_regularizer(x):    
+#    f_s = tf.math.softplus(x) #tf.math.log(1. + tf.math.exp(x))
+#    return  - tf.reduce_mean(1. + tf.math.log(f_s) - f_s )
+            
+def sigma_regularizer1(x):
+    input_size = 1.0   
+    f_s = tf.math.softplus(x) #tf.math.log(1. + tf.math.exp(x)) 
+    return  input_size * tf.reduce_mean(1. + tf.math.log(f_s) - f_s )
+#
+def sigma_regularizer2(x):      
+    f_s = tf.math.softplus(x)#  tf.math.log(1. + tf.math.exp(x))
+    return  tf.reduce_mean(1. + tf.math.log(f_s) - f_s )
+    
+    
+class densityPropLSTMCell(keras.layers.Layer):
+    def __init__(self, units, **kwargs):
+        self.units = units
+        self.state_size = [tf.TensorShape([units]), tf.TensorShape([units]), tf.TensorShape([units, units]), tf.TensorShape([units, units])]
+        super(densityPropLSTMCell, self).__init__(**kwargs)
+    def build(self, input_shape):
+        #print(input_shape)
+        input_size = input_shape[-1]
+        #print(input_size)
+        ini_sigma = -4.6
+       # min_sigma = -4.5
+        init_mu = 0.05       
+        seed_ = None
+        tau1 = -1./ input_size
+        tau2 = -1./self.units
+              
+        self.U_f = self.add_weight(name='U_f', shape=(input_size, self.units), initializer=tf.random_normal_initializer( mean=0.0, stddev=init_mu, seed=seed_), regularizer=tf.keras.regularizers.l2(tau1)  , trainable=True) 
+        self.uf_sigma = self.add_weight(name='uf_sigma', shape=(self.units,),  initializer= tf.constant_initializer(ini_sigma) , regularizer=sigma_regularizer1,  trainable=True)         
+       
+        self.W_f = self.add_weight(name='W_f', shape=(self.units, self.units), initializer=tf.random_normal_initializer( mean=0.0, stddev=init_mu, seed=seed_), regularizer=tf.keras.regularizers.l2(tau2), trainable=True)
+        self.wf_sigma = self.add_weight(name='wf_sigma', shape=(self.units,),  initializer=tf.constant_initializer(ini_sigma),regularizer=sigma_regularizer2,   trainable=True)
+      
+        self.U_i = self.add_weight(name='U_i', shape=(input_size, self.units), initializer=tf.random_normal_initializer( mean=0.0, stddev=init_mu, seed=seed_), regularizer=tf.keras.regularizers.l2(tau1), trainable=True)
+        self.ui_sigma = self.add_weight(name='ui_sigma', shape=(self.units,),  initializer=tf.constant_initializer(ini_sigma), regularizer=sigma_regularizer1,  trainable=True)
+      
+        self.W_i = self.add_weight(name='W_i',  shape=(self.units, self.units), initializer=tf.random_normal_initializer( mean=0.0, stddev=init_mu, seed=seed_), regularizer=tf.keras.regularizers.l2(tau2), trainable=True)
+        self.wi_sigma = self.add_weight(name='wi_sigma', shape=(self.units,),  initializer=tf.constant_initializer(ini_sigma), regularizer=sigma_regularizer2, trainable=True)
+    
+        self.U_o = self.add_weight(name='U_o', shape=(input_size, self.units), initializer=tf.random_normal_initializer( mean=0.0, stddev=init_mu, seed=seed_), regularizer=tf.keras.regularizers.l2(tau1), trainable=True)
+        self.uo_sigma = self.add_weight(name='uo_sigma', shape=(self.units,),  initializer=tf.constant_initializer(ini_sigma), regularizer=sigma_regularizer1, trainable=True)
+       
+        self.W_o = self.add_weight(name='W_o', shape=(self.units, self.units), initializer=tf.random_normal_initializer( mean=0.0, stddev=init_mu, seed=seed_), regularizer=tf.keras.regularizers.l2(tau2), trainable=True)
+        self.wo_sigma = self.add_weight(name='wo_sigma', shape=(self.units,),  initializer=tf.constant_initializer(ini_sigma), regularizer=sigma_regularizer2, trainable=True)        
+    
+        self.U_g = self.add_weight(name='U_g', shape=(input_size, self.units), initializer=tf.random_normal_initializer( mean=0.0, stddev=init_mu, seed=seed_), regularizer=tf.keras.regularizers.l2(tau1), trainable=True)
+        self.ug_sigma = self.add_weight(name='ug_sigma', shape=(self.units,),  initializer=tf.constant_initializer(ini_sigma), regularizer=sigma_regularizer1, trainable=True)
+     
+        self.W_g = self.add_weight(name='W_g', shape=(self.units, self.units), initializer=tf.random_normal_initializer( mean=0.0, stddev=init_mu, seed=seed_), regularizer=tf.keras.regularizers.l2(tau2), trainable=True)
+        self.wg_sigma = self.add_weight(name='wg_sigma', shape=(self.units,),  initializer=tf.constant_initializer(ini_sigma), regularizer=sigma_regularizer2, trainable=True)        
+
+        self.built = True     
+    def call(self, inputs, states):        
+        # state should be in [(batch, units), (batch, units, units)], mean vector and covaraince matrix
+        prev_state, prev_istate, Sigma_state, Sigma_istate = states
+        
+        ## Forget Gate
+        f = tf.sigmoid (tf.matmul(inputs, self.U_f) + tf.matmul(prev_state, self.W_f))       
+        Uf_Sigma = tf.linalg.diag(tf.math.softplus(self.uf_sigma)   )                                         
+        Sigma_Uf = x_Sigma_w_x_T(inputs, Uf_Sigma)         
+        ################        
+        Wf_Sigma = tf.linalg.diag(tf.math.softplus(self.wf_sigma)   )             
+        Sigma_f1 = w_t_Sigma_i_w (self.W_f, Sigma_state)
+        Sigma_f2 = x_Sigma_w_x_T(prev_state, Wf_Sigma)                                   
+        Sigma_f3 = tr_Sigma_w_Sigma_in (Sigma_state, Wf_Sigma)
+        Sigma_out_ff = Sigma_f1 + Sigma_f2 + Sigma_f3 + Sigma_Uf
+        ################
+        gradi_f = grad_sigmoid(tf.matmul(inputs, self.U_f) + tf.matmul(prev_state, self.W_f))
+        Sigma_out_f = activation_Sigma(gradi_f, Sigma_out_ff)
+        ###################################
+        ###################################
+        ## Input Gate
+        i = tf.sigmoid (tf.matmul(inputs, self.U_i) + tf.matmul(prev_state, self.W_i))          
+        Ui_Sigma = tf.linalg.diag(tf.math.softplus(self.ui_sigma)   )                                      
+        Sigma_Ui = x_Sigma_w_x_T(inputs, Ui_Sigma)
+        ################           
+        Wi_Sigma = tf.linalg.diag(tf.math.softplus(self.wi_sigma)   )           
+        Sigma_i1 = w_t_Sigma_i_w (self.W_i, Sigma_state)
+        Sigma_i2 = x_Sigma_w_x_T(prev_state, Wi_Sigma)                                  
+        Sigma_i3 = tr_Sigma_w_Sigma_in (Sigma_state, Wi_Sigma)
+        Sigma_out_ii = Sigma_i1 + Sigma_i2 + Sigma_i3 + Sigma_Ui
+        ################        
+        gradi_i = grad_sigmoid(tf.matmul(inputs, self.U_i) + tf.matmul(prev_state, self.W_i))
+        Sigma_out_i = activation_Sigma(gradi_i, Sigma_out_ii)
+        ###################################
+        ###################################
+        ## Output Gate
+        o = tf.sigmoid (tf.matmul(inputs, self.U_o) + tf.matmul(prev_state, self.W_o))          
+        Uo_Sigma = tf.linalg.diag(tf.math.softplus(self.uo_sigma)   )                                            
+        Sigma_Uo = x_Sigma_w_x_T(inputs, Uo_Sigma)         
+        ################        
+        Wo_Sigma = tf.linalg.diag(tf.math.softplus(self.wo_sigma)   )         
+        Sigma_o1 = w_t_Sigma_i_w (self.W_o, Sigma_state)
+        Sigma_o2 = x_Sigma_w_x_T(prev_state, Wo_Sigma)                                   
+        Sigma_o3 = tr_Sigma_w_Sigma_in (Sigma_state, Wo_Sigma)
+        Sigma_out_oo = Sigma_o1 + Sigma_o2 + Sigma_o3 + Sigma_Uo
+        ################
+        gradi_o = grad_sigmoid(tf.matmul(inputs, self.U_o) + tf.matmul(prev_state, self.W_o))
+        Sigma_out_o = activation_Sigma(gradi_o, Sigma_out_oo)
+        ###################################
+        ###################################
+        ## Gate Gate
+        g = tf.tanh (tf.matmul(inputs, self.U_g) + tf.matmul(prev_state, self.W_g))       
+        Ug_Sigma = tf.linalg.diag(tf.math.softplus(self.ug_sigma)   )                                    
+        Sigma_Ug = x_Sigma_w_x_T(inputs, Ug_Sigma)         
+        ################          
+        Wg_Sigma = tf.linalg.diag(tf.math.softplus(self.wg_sigma)   )        
+        Sigma_g1 = w_t_Sigma_i_w (self.W_g, Sigma_state)
+        Sigma_g2 = x_Sigma_w_x_T(prev_state, Wg_Sigma)                                   
+        Sigma_g3 = tr_Sigma_w_Sigma_in (Sigma_state, Wg_Sigma)
+        Sigma_out_gg = Sigma_g1 + Sigma_g2 + Sigma_g3 + Sigma_Ug
+        ################
+        gradi_g = grad_tanh(tf.matmul(inputs, self.U_g) + tf.matmul(prev_state, self.W_g))
+        Sigma_out_g = activation_Sigma(gradi_g, Sigma_out_gg)
+        ###################################
+        ###################################
+        ## Current Internal State 
+        c = tf.multiply(prev_istate, f) + tf.multiply(i, g)      
+        ################
+        sigma_cf = Hadamard_sigma(Sigma_istate, Sigma_out_f, prev_istate, f)
+        sigma_ig = Hadamard_sigma(Sigma_out_i, Sigma_out_g, i, g)
+        Sigma_out_c = sigma_cf + sigma_ig
+        ###################################
+        ###################################
+        ## Current State              
+        mu_out = tf.multiply(tf.tanh(c), o)
+        ################
+        gradi_tanhc = grad_tanh(c)
+        Sigma_out_tanhc = activation_Sigma(gradi_tanhc, Sigma_out_c)        
+        Sigma_out = Hadamard_sigma(Sigma_out_tanhc, Sigma_out_o, tf.tanh(c), o)   
+        
+        Sigma_out_c = tf.where(tf.math.is_nan(Sigma_out_c), tf.zeros_like(Sigma_out_c), Sigma_out_c)
+        Sigma_out_c = tf.where(tf.math.is_inf(Sigma_out_c), tf.zeros_like(Sigma_out_c), Sigma_out_c)
+        Sigma_out_c = tf.linalg.set_diag(Sigma_out_c, tf.abs(tf.linalg.diag_part(Sigma_out_c)))     
+        
+        Sigma_out = tf.where(tf.math.is_nan(Sigma_out), tf.zeros_like(Sigma_out), Sigma_out)
+        Sigma_out = tf.where(tf.math.is_inf(Sigma_out), tf.zeros_like(Sigma_out), Sigma_out)
+        Sigma_out = tf.linalg.set_diag(Sigma_out, tf.abs(tf.linalg.diag_part(Sigma_out))) 
+        
+        output = mu_out
+        new_state = (mu_out, c, Sigma_out, Sigma_out_c)    
+        return output, new_state
+        
+# Linear Class - Second Layer (RV * RV)
+class LinearNotFirst(keras.layers.Layer):
+    """y = w.x + b"""
+    def __init__(self, units):
+        super(LinearNotFirst, self).__init__()
+        self.units = units
+                
+    def build(self, input_shape):
+        ini_sigma = -2.2
+        #min_sigma = -4.5
+        tau = -1. /input_shape[-1]    
+        
+        self.w_mu = self.add_weight(name = 'w_mu', shape=(input_shape[-1], self.units),
+            initializer=tf.random_normal_initializer( mean=0.0, stddev=0.05, seed=None), regularizer=tf.keras.regularizers.l2(tau),#tau/self.units), #tf.keras.regularizers.l2(0.5*0.001),
+            trainable=True,
+        )
+        self.w_sigma = self.add_weight(name = 'w_sigma',
+            shape=(self.units,),
+            initializer= tf.constant_initializer(ini_sigma),#tf.random_uniform_initializer(minval= min_sigma, maxval=ini_sigma, seed=None) , 
+            regularizer=sigma_regularizer2, #   tf.constant_initializer(ini_sigma)
+            trainable=True,
+        )   
+    def call(self, mu_in, Sigma_in):        
+        mu_out = tf.matmul(mu_in, self.w_mu) #+ self.b_mu       
+        W_Sigma = tf.linalg.diag(tf.math.log(1. + tf.math.exp(self.w_sigma)))       
+        Sigma_1 = w_t_Sigma_i_w (self.w_mu, Sigma_in)
+        Sigma_2 = x_Sigma_w_x_T(mu_in, W_Sigma)                                   
+        Sigma_3 = tr_Sigma_w_Sigma_in (Sigma_in, W_Sigma)
+        Sigma_out = Sigma_1 + Sigma_2 + Sigma_3 #+ tf.linalg.diag(tf.math.log(1. + tf.math.exp(self.b_sigma)))  
+        
+        Sigma_out = tf.where(tf.math.is_nan(Sigma_out), tf.zeros_like(Sigma_out), Sigma_out)
+        Sigma_out = tf.where(tf.math.is_inf(Sigma_out), tf.zeros_like(Sigma_out), Sigma_out)  
+        Sigma_out = tf.linalg.set_diag(Sigma_out, tf.abs(tf.linalg.diag_part(Sigma_out)))
+        return mu_out, Sigma_out
+
+       
+
+class mysoftmax(keras.layers.Layer):
+    """Mysoftmax"""
+    def __init__(self):
+        super(mysoftmax, self).__init__()
+    def call(self, mu_in, Sigma_in):
+        mu_out = tf.nn.softmax(mu_in)
+        pp1 = tf.expand_dims(mu_out, axis=2)
+        pp2 = tf.expand_dims(mu_out, axis=1)
+        ppT = tf.matmul(pp1, pp2)
+        p_diag = tf.linalg.diag(mu_out)
+        grad = p_diag - ppT
+        Sigma_out = tf.matmul(grad, tf.matmul(Sigma_in, tf.transpose(grad, perm=[0, 2, 1])))
+        Sigma_out = tf.where(tf.math.is_nan(Sigma_out), tf.zeros_like(Sigma_out), Sigma_out)
+        Sigma_out = tf.where(tf.math.is_inf(Sigma_out), tf.zeros_like(Sigma_out), Sigma_out)
+        
+        Sigma_out = tf.linalg.set_diag(Sigma_out, tf.abs(tf.linalg.diag_part(Sigma_out)))
+        return mu_out, Sigma_out       
+
+#def nll_gaussian(y_test, y_pred_mean, y_pred_sd, num_labels, batch_size):
+#    
+#    y_pred_sd_ns = y_pred_sd 
+#    s, u, v = tf.linalg.svd(y_pred_sd_ns, full_matrices=True, compute_uv=True)	
+#    s_ = s + 1.0e-4
+#    s_inv = tf.linalg.diag(tf.math.divide_no_nan(1., s_) )    
+#    y_pred_sd_inv = tf.matmul(tf.matmul(v, s_inv), u, transpose_b=True) 
+#    mu_ =  tf.expand_dims(y_pred_mean - y_test, axis=1) 
+#    mu_sigma = tf.matmul(mu_ ,  y_pred_sd_inv)     
+#    loss1 =  tf.squeeze(tf.matmul(mu_sigma , mu_, transpose_b=True))
+#    
+#  #  if tf.reduce_any(tf.math.greater(s , tf.constant(1e-6, shape=[batch_size, num_labels]))):
+#    loss1 = tf.math.add(loss1, tf.math.reduce_sum(tf.math.log(s_), axis =-1) )    
+#      
+#    loss = tf.reduce_mean(loss1)
+#    loss = tf.where(tf.math.is_nan(loss), tf.zeros_like(loss), loss)
+#    loss = tf.where(tf.math.is_inf(loss), tf.zeros_like(loss), loss)
+#    return loss#, tf.reduce_mean(tf.squeeze(tf.matmul(mu_sigma , mu_, transpose_b=True))), tf.reduce_mean(tf.math.reduce_sum(tf.math.log(s_), axis =-1))
+
+def nll_gaussian(y_test, y_pred_mean, y_pred_sd, num_labels, batch_size):    
+    y_pred_sd_ns = y_pred_sd 
+    s, u, v = tf.linalg.svd(y_pred_sd_ns, full_matrices=True, compute_uv=True)	
+    s_ =  s + 1.0e-5  #tf.clip_by_value(t=s, clip_value_min=tf.constant(1e-5),       clip_value_max=tf.constant(1e+5)) #
+    s_inv = tf.linalg.diag(tf.math.divide_no_nan(1., s_) )    
+    y_pred_sd_inv = tf.matmul(tf.matmul(v, s_inv), tf.transpose(u, [0, 2,1])) 
+    mu_ = y_test - y_pred_mean 
+    mu_sigma = tf.matmul( tf.expand_dims(mu_, axis=1)  ,  y_pred_sd_inv)     
+    loss1 =  tf.squeeze(tf.matmul(mu_sigma ,  tf.expand_dims(mu_, axis=2) ))   
+    loss2 =  0.5*tf.math.reduce_mean(tf.math.reduce_sum(tf.math.log(s_), axis =-1) )        
+    loss = tf.math.reduce_mean(tf.math.add(loss1,loss2))
+    loss = tf.where(tf.math.is_nan(loss), tf.zeros_like(loss), loss)
+    loss = tf.where(tf.math.is_inf(loss), tf.zeros_like(loss), loss) 
+    return loss
+    
+class Density_prop_LSTM(tf.keras.Model):
+  def __init__(self, units, num_classes, name=None):
+    super(Density_prop_LSTM, self).__init__()
+    self.units = units
+    self.num_classes = num_classes
+    self.cell = densityPropLSTMCell(self.units)    
+    self.rnn = tf.keras.layers.RNN(self.cell, return_state=True)
+    self.linear_1 = LinearNotFirst(self.num_classes)
+    self.mysoftma = mysoftmax()
+
+  def call(self, inputs, training=True):
+    xx = self.rnn(inputs)    
+    x, mu_state, c_state, sigma_state, sigma_cstate = xx    
+    m, s = self.linear_1(x, sigma_state)
+    outputs, Sigma = self.mysoftma(m, s)    
+    Sigma = tf.where(tf.math.is_nan(Sigma), tf.zeros_like(Sigma), Sigma)
+    Sigma = tf.where(tf.math.is_inf(Sigma), tf.zeros_like(Sigma), Sigma)      
+    return outputs, Sigma
+    
+    
+def load_data(ratio,dataset):
+  """Input:
+  
+  ratio: ratio to split training and testset 
+  dataset: name of the dataset in the UCR archive"""
+  datadir = dataset + '/' + dataset 
+  data_train = np.loadtxt(datadir+'_TRAIN',delimiter=',')
+  data_test_val = np.loadtxt(datadir+'_TEST',delimiter=',')
+  DATA = np.concatenate((data_train,data_test_val),axis=0)
+  N = DATA.shape[0]
+
+  ratio = (ratio*N).astype(np.int32)
+  ind = np.random.permutation(N)
+  X_train = DATA[ind[:ratio[0]],1:]
+  X_val = DATA[ind[ratio[0]:ratio[1]],1:]
+  X_test = DATA[ind[ratio[1]:],1:]
+  # Targets have labels 1-indexed. We subtract one for 0-indexed 
+  y_train = DATA[ind[:ratio[0]],0]-1
+  y_val = DATA[ind[ratio[0]:ratio[1]],0]-1
+  y_test = DATA[ind[ratio[1]:],0]-1 
+  return X_train,X_val,X_test,y_train,y_val,y_test       
+    
+def main_function(time_step=1, input_dim=140, units=200, class_num=5 , batch_size=50, epochs=100, kl_factor=0.0001,
+     lr = 0.001, lr_end=0.00001 , Random_noise=False, gaussain_noise_std=0.5, Adversarial_noise=True, Targeted=False, epsilon=0.3, adversary_target_cls=3,
+     BIM_adversarial=True, alpha=1, maxAdvStep=100,
+     Training=False, Testing=False, continue_training=False, saved_model_epochs=0):
+
+    PATH = './latest_results/vdp_saved_models_units_{}/vdp_lstm_epoch_{}/'.format(units, epochs)     
+    ratio = np.array([0.8,0.9]) #Ratios where to split the training and validation set
+    X_train,X_val,X_test,y_train,y_val,y_test = load_data(ratio,dataset='ECG5000')
+    
+    x_train = (X_train-np.amin(X_train)) / (np.amax(X_train)-np.amin(X_train))
+    x_val = ( X_val-np.amin(X_val))/ (np.amax(X_val)-np.amin(X_val))
+    x_test = (X_test-np.amin(X_test) )/ (np.amax(X_test) - np.amin(X_test) ) 
+    x_train = x_train.astype('float32')
+    x_val = x_val.astype('float32') 
+    x_test = x_test.astype('float32') 
+    x_train = tf.expand_dims(x_train, 1)
+    x_test = tf.expand_dims(x_test, 1)
+    x_val = tf.expand_dims(x_val, 1)
+    one_hot_y_train = tf.one_hot(y_train.astype(np.float32), depth=class_num)
+    one_hot_y_test = tf.one_hot(y_test.astype(np.float32), depth=class_num)
+    one_hot_y_val = tf.one_hot(y_val.astype(np.float32), depth=class_num)
+    tr_dataset = tf.data.Dataset.from_tensor_slices((x_train, one_hot_y_train)).batch(batch_size)
+    val_dataset = tf.data.Dataset.from_tensor_slices((x_val, one_hot_y_val)).batch(batch_size)
+    test_dataset = tf.data.Dataset.from_tensor_slices((x_test, one_hot_y_test)).batch(batch_size)
+
+    # Cutom Trianing Loop with Graph  
+    lstm_model = Density_prop_LSTM(units, class_num, name = 'vdp_lstm')           
+    num_train_steps = epochs * int(x_train.shape[0] /batch_size)
+    learning_rate_fn = tf.keras.optimizers.schedules.PolynomialDecay(initial_learning_rate=lr,  decay_steps=num_train_steps,  end_learning_rate=lr_end, power=4.)      
+    optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate_fn)# , clipnorm= 1.0)        
+        
+    @tf.function()# Make it fast.       
+    def train_on_batch(x, y):
+        with tf.GradientTape() as tape:
+          logits, sigma = lstm_model(x, training=True)           
+          loss_final = nll_gaussian(y, logits,  tf.clip_by_value(t=sigma, clip_value_min=tf.constant(-1e+6),
+                                   clip_value_max=tf.constant(1e+6)), class_num , batch_size)
+          regularization_loss=tf.math.add_n(lstm_model.losses)             
+          loss = 0.5 * (loss_final - kl_factor*regularization_loss )           
+        gradients = tape.gradient(loss, lstm_model.trainable_weights)            
+#            for g,v in zip(gradients, lstm_model.trainable_weights):
+#                tf.print(v.name, tf.reduce_max(g))
+#            gradients = [(tf.clip_by_value(grad, -10., 10.))
+#                                  for grad in gradients]  
+        gradients = [(tf.where(tf.math.is_nan(grad), tf.zeros(grad.shape), grad)) for grad in gradients] 
+        gradients = [(tf.where(tf.math.is_inf(grad), tf.zeros(grad.shape), grad)) for grad in gradients]    
+        optimizer.apply_gradients(zip(gradients, lstm_model.trainable_weights))       
+        return loss, logits, sigma, gradients, regularization_loss, loss_final 
+          
+    @tf.function()# Make it fast.    
+    def valid_on_batch(x, y):                     
+        mu_out, sigma = lstm_model(x, training=False) 
+      #  lstm_model.trainable = False              
+        vloss = nll_gaussian(y, mu_out,  tf.clip_by_value(t=sigma, clip_value_min=tf.constant(-1e+6),
+                                           clip_value_max=tf.constant(1e+6)), class_num , batch_size)                                           
+        regularization_loss=tf.math.add_n(lstm_model.losses)
+        total_vloss = 0.5 *(vloss - kl_factor*regularization_loss)    
+        return total_vloss, mu_out, sigma, regularization_loss, vloss
+            
+    @tf.function       
+    def test_on_batch(x):  
+      #  lstm_model.trainable = False                    
+        mu_out, sigma = lstm_model(x, training=False)            
+        return mu_out, sigma
+        
+            
+    @tf.function   
+    def create_adversarial_pattern(input_image, input_label):
+          with tf.GradientTape() as tape:
+            tape.watch(input_image)
+            lstm_model.trainable = False 
+            prediction, sigma = lstm_model(input_image) 
+            loss_final = nll_gaussian(input_label, prediction,  tf.clip_by_value(t=sigma, clip_value_min=tf.constant(-1e+6),
+                                   clip_value_max=tf.constant(1e+6)), class_num , batch_size)                         
+            loss = 0.5 * loss_final 
+          # Get the gradients of the loss w.r.t to the input image.
+          gradient = tape.gradient(loss, input_image)
+          gradient = tf.where(tf.math.is_nan(gradient),  tf.constant(1.0e-6, shape=gradient.shape), gradient)
+          gradient = tf.where(tf.math.is_inf(gradient),  tf.constant(1.0e-6, shape=gradient.shape), gradient)
+          # Get the sign of the gradients to create the perturbation
+          signed_grad = tf.sign(gradient)
+          return signed_grad              
+    
+             
+    if Training:
+        wandb.init(entity = "dimah", project="VDP_LSTM_ECG5000_units_{}_epochs_{}_lr_{}_latest_results".format(units, epochs, lr)) 
+        if continue_training:
+            saved_model_path = './latest_results/vdp_saved_models_units_{}/vdp_lstm_epoch_{}/'.format(units, saved_model_epochs) 
+            
+            lstm_model.load_weights(saved_model_path + 'vdp_lstm_model') 
+        train_acc = np.zeros(epochs)
+        valid_acc = np.zeros(epochs)
+        train_err = np.zeros(epochs)
+        valid_error = np.zeros(epochs)
+        start = timeit.default_timer()
+        for epoch in range(epochs):
+            print('Epoch: ', epoch+1, '/' , epochs)
+            acc1 = 0
+            acc_valid1 = 0
+            err1 = 0
+            err_valid1 = 0
+            tr_no_steps = 0
+            va_no_steps = 0
+            #Training
+            for step, (x, y) in enumerate(tr_dataset):
+                update_progress(step / int(x_train.shape[0] / (batch_size)) )
+                if (x.shape[0] == batch_size):  
+                    loss, logits, sigma, gradients, regularization_loss, loss_final  = train_on_batch(x, y)
+                    err1+= loss.numpy()
+                    corr = tf.equal(tf.math.argmax(logits, axis=1),tf.math.argmax(y,axis=1))
+                    accuracy = tf.reduce_mean(tf.cast(corr,tf.float32))
+                    acc1+=accuracy.numpy()                
+                    if step % 50 == 0:
+                        print("Step:", step, "Loss:", float(loss.numpy()))
+                        print("Training accuracy so far: %.3f" % accuracy.numpy())                    
+                    tr_no_steps+=1
+                    wandb.log({"Trianing Loss per minibatch": loss.numpy(),
+                                "Training Accuracy per minibatch": accuracy.numpy(),  
+                                "gradient per minibatch": np.mean(gradients[0]),   
+                                "Average Variance value": tf.reduce_mean(sigma).numpy(),
+                                "Regularization_loss": regularization_loss.numpy(),                               
+                                 "Log-Likelihood Loss": np.mean(loss_final.numpy()),                                                        
+                                'epoch': epoch
+                        }) 
+
+            train_acc[epoch] = acc1/tr_no_steps
+            train_err[epoch] = err1/tr_no_steps
+            print('Training Acc  ', train_acc[epoch])
+            print('Training error  ', train_err[epoch])
+
+            # Validation
+            for step, (x, y) in enumerate(val_dataset):
+                update_progress(step / int(x_val.shape[0] / (batch_size)) )
+                if (x.shape[0] == batch_size):                   
+                    total_vloss, logits, sigma, regularization_loss, vloss = valid_on_batch(x, y)                
+                    err_valid1+= total_vloss.numpy()
+                    corr = tf.equal(tf.math.argmax(logits, axis=1),tf.math.argmax(y,axis=1))
+                    accuracy = tf.reduce_mean(tf.cast(corr,tf.float32))
+                    acc_valid1+=accuracy.numpy()
+                    if step % 50 == 0:
+                        print("Step:", step, "Loss:", float(total_vloss.numpy()))
+                        print("Average validation accuracy so far: %.3f" % accuracy.numpy())                    
+                    va_no_steps+=1                          
+                    wandb.log({"Average Variance value (validation Set)": tf.reduce_mean(sigma).numpy(),
+                               "Regularization_loss (validation Set)": regularization_loss.numpy(),                               
+                               "Log-Likelihood Loss (validation Set)": np.mean(vloss.numpy() ),
+                               "Validation Loss per minibatch": total_vloss.numpy() ,                              
+                               "Validation Acuracy per minibatch": accuracy.numpy()                                                         
+                                    })  
+                                                                             
+                    lstm_model.save_weights(PATH + 'vdp_lstm_model') 
+            wandb.log({"Training Loss": (err1 / tr_no_steps),  
+                        "Training Accuracy": (acc1 / tr_no_steps),                      
+                        "Validation Loss": (err_valid1 / va_no_steps),
+                        "Validation Accuracy": (acc_valid1 / va_no_steps),
+                        'epoch': epoch
+                       })
+
+            valid_acc[epoch] = acc_valid1/va_no_steps
+            valid_error[epoch] = err_valid1/va_no_steps
+            stop = timeit.default_timer()
+            print('Total Training Time: ', stop - start)
+            print('Training Acc  ', train_acc[epoch])
+            print('Validation Acc  ', valid_acc[epoch])
+            print('------------------------------------')
+            print('Training error  ', train_err[epoch])
+            print('Validation error  ', valid_error[epoch])
+        lstm_model.save_weights(PATH + 'vdp_lstm_model')
+        if (epochs > 1):
+            fig = plt.figure(figsize=(15,7))
+            plt.plot(train_acc, 'b', label='Training acc')
+            plt.plot(valid_acc,'r' , label='Validation acc')
+            plt.ylim(0, 1.1)
+            plt.title("VDP LSTM on ECG Data")
+            plt.xlabel("Epochs")
+            plt.ylabel("Accuracy")
+            plt.legend(loc='lower right')
+            plt.savefig(PATH + 'VDP_LSTM_on_ECG_Data_acc.png')
+            plt.close(fig)
+
+            fig = plt.figure(figsize=(15,7))
+            plt.plot(train_err, 'b', label='Training error')
+            plt.plot(valid_error,'r' , label='Validation error')
+            #plt.ylim(0, 1.1)
+            plt.title("VDP LSTM on ECG Data")
+            plt.xlabel("Epochs")
+            plt.ylabel("Error")
+            plt.legend(loc='lower right')
+            plt.savefig(PATH + 'VDP_LSTM_on_ECG_Data_error.png')
+            plt.close(fig)
+        f = open(PATH + 'training_validation_acc_error.pkl', 'wb')
+        pickle.dump([train_acc, valid_acc, train_err, valid_error], f)
+        f.close()
+
+        textfile = open(PATH + 'Related_hyperparameters.txt','w')
+        textfile.write(' Input Dimension : ' +str(input_dim))
+        textfile.write('\n No Hidden Nodes : ' +str(units))
+        textfile.write('\n Number of Classes : ' +str(class_num))
+        textfile.write('\n No of epochs : ' +str(epochs))        
+        textfile.write('\n time step : ' +str(time_step))
+        textfile.write('\n Initial Learning rate : ' + str(lr))
+        textfile.write('\n Ending Learning rate : ' +str(lr_end)) 
+        textfile.write('\n batch size : ' +str(batch_size))
+        textfile.write('\n KL term factor : ' +str(kl_factor))  
+        textfile.write("\n---------------------------------")
+        if Training:
+            textfile.write('\n Total run time in sec : ' +str(stop - start))
+            if(epochs == 1):
+                textfile.write("\n Averaged Training  Accuracy : "+ str( train_acc))
+                textfile.write("\n Averaged Validation Accuracy : "+ str(valid_acc ))
+
+                textfile.write("\n Averaged Training  error : "+ str( train_err))
+                textfile.write("\n Averaged Validation error : "+ str(valid_error ))
+            else:
+                textfile.write("\n Averaged Training  Accuracy : "+ str(np.mean(train_acc[epoch])))
+                textfile.write("\n Averaged Validation Accuracy : "+ str(np.mean(valid_acc[epoch])))
+
+                textfile.write("\n Averaged Training  error : "+ str(np.mean(train_err[epoch])))
+                textfile.write("\n Averaged Validation error : "+ str(np.mean(valid_error[epoch])))
+        textfile.write("\n---------------------------------")
+        textfile.write("\n---------------------------------")
+        textfile.close()
+
+    if(Testing):    
+        test_path = 'test_results/'
+        if Random_noise:
+            test_path = 'test_random_noise_{}/'.format(gaussain_noise_std) 
+        os.makedirs(PATH + test_path)          
+        lstm_model.load_weights(PATH + 'vdp_lstm_model')        
+        
+        test_no_steps = 0  
+        err_test = np.zeros(int(x_test.shape[0] /batch_size))
+        acc_test = np.zeros(int(x_test.shape[0] /batch_size))        
+        true_x = np.zeros([int(x_test.shape[0] /batch_size), batch_size, time_step, input_dim])
+        true_y = np.zeros([int(x_test.shape[0] /batch_size), batch_size, class_num])
+        mu_out_ = np.zeros([int(x_test.shape[0] /batch_size), batch_size, class_num])           
+        sigma_ = np.zeros([int(x_test.shape[0] / (batch_size)), batch_size, class_num, class_num])
+        test_start = timeit.default_timer()
+        for step, (x, y) in enumerate(test_dataset):
+          update_progress(step / int(x_test.shape[0] / (batch_size)) )
+          if (x.shape[0] == batch_size):  
+              true_x[test_no_steps, :, :, :] = x.numpy()
+              true_y[test_no_steps, :, :] = y.numpy()
+              if Random_noise:
+                  noise = tf.random.normal(shape = [batch_size, time_step, input_dim], mean = 0.0, stddev = gaussain_noise_std, dtype = x.dtype )
+                  x = x +  noise
+              #logits, sigma = test_on_batch(x) 
+              tloss, logits, sigma, regularization_loss, vloss = valid_on_batch(x, y)
+              mu_out_[test_no_steps,:,:] =logits.numpy() 
+              sigma_[test_no_steps, :, :, :]= sigma.numpy()              
+              err_test[test_no_steps] = tloss.numpy() 
+    
+              corr = tf.equal(tf.math.argmax(logits, axis=1),tf.math.argmax(y,axis=1))
+              accuracy = tf.reduce_mean(tf.cast(corr,tf.float32))
+              acc_test[test_no_steps]=accuracy.numpy()
+    
+              if step % 50 == 0:
+                  print("Step:", step, "Loss:", float(tloss.numpy()))
+                  print("Test accuracy: %.3f" % accuracy.numpy())
+               # loss_total_layer.append(loss_layers)
+              test_no_steps+=1               
+        test_stop = timeit.default_timer()
+        print('Total Test Time: ', test_stop - test_start)
+        test_acc = np.mean(acc_test) 
+        test_error = np.mean(err_test) 
+        print('Test accuracy : ', test_acc)
+        print('Test error : ', test_error)
+        
+        if Random_noise:
+            snr_signal = np.zeros([int(x_test.shape[0]/(batch_size)) ,batch_size])
+            for i in range(int(x_test.shape[0]/(batch_size))):
+                for j in range(batch_size):
+                    noise = tf.random.normal(shape = [time_step, input_dim ], mean = 0.0, stddev = gaussain_noise_std, dtype = x.dtype ).numpy()             
+                    snr_signal[i,j] = 10*np.log10( np.sum(np.square(true_x[i,j,:, :]))/np.sum( np.square(noise) ))
+            print('SNR', np.mean(snr_signal))        
+        
+        pf = open(PATH + test_path + 'prediction_info.pkl', 'wb')         
+        pickle.dump([mu_out_,true_y, sigma_,  acc_test, err_test ], pf)                                                   
+        pf.close()  
+        
+        
+#        writer = pd.ExcelWriter(PATH + test_path + 'Covarience_matrices.xlsx', engine='xlsxwriter')
+#        for i in range(int(x_test.shape[0]/batch_size)):
+#            for j in range(batch_size):  
+#                df = pd.DataFrame(sigma_[i,j,:,:])    
+#                # Write your DataFrame to a file   
+#                df.to_excel(writer, "Sheet", startrow=i*(class_num+4),  startcol=j*(class_num+6))
+#                # Save the result
+#                df1 = pd.DataFrame(mu_out_[i,j,:])
+#                df1.to_excel(writer, 'Sheet', startrow=i*(class_num+4),  startcol=(7 + j*(class_num+6)))
+#        writer.save() 
+        
+        var = np.zeros([int(x_test.shape[0] /batch_size) ,batch_size])        
+        for i in range(int(x_test.shape[0] /batch_size)):
+            for j in range(batch_size):               
+                predicted_out = np.argmax(mu_out_[i,j,:])
+                var[i,j] = sigma_[i,j, int(predicted_out), int(predicted_out)]          
+        print('Average Output Variance', np.mean(var))   
+            
+        var1 = np.reshape(var, int(x_test.shape[0]/(batch_size))* batch_size)                
+        writer = pd.ExcelWriter(PATH + test_path + 'variance.xlsx', engine='xlsxwriter')
+        df = pd.DataFrame(np.abs(var1) )   
+        # Write your DataFrame to a file   
+        df.to_excel(writer, "Sheet")           
+        writer.save()
+        
+              
+        textfile = open(PATH + test_path + 'Related_hyperparameters.txt','w')    
+        textfile.write(' Input Dimension : ' +str(input_dim))
+        textfile.write('\n No Hidden Nodes : ' +str(units))
+        textfile.write('\n Number of Classes : ' +str(class_num))
+        textfile.write('\n No of epochs : ' +str(epochs))        
+        textfile.write('\n time step : ' +str(time_step))   
+        textfile.write('\n batch size : ' +str(batch_size))  
+        textfile.write('\n Initial Learning rate : ' + str(lr))
+        textfile.write('\n Ending Learning rate : ' +str(lr_end)) 
+        textfile.write('\n KL term factor : ' +str(kl_factor))       
+        textfile.write("\n---------------------------------")
+        textfile.write('\n Total test time in sec : ' +str(test_stop - test_start))      
+        textfile.write("\n Test Accuracy : "+ str( test_acc))
+        textfile.write("\n Test error : "+ str(test_error))     
+        textfile.write("\n Average Output Variance: "+ str(np.mean(var1)))                   
+        textfile.write("\n---------------------------------")
+        if Random_noise:
+            textfile.write('\n Random Noise std: '+ str(gaussain_noise_std )) 
+            textfile.write("\n SNR: "+ str(np.mean(snr_signal)))                
+        textfile.write("\n---------------------------------")    
+        textfile.close()
+          
+    if(Adversarial_noise):
+        if Targeted:
+            test_path = 'test_targeted_adv_noise_{}/'.format(epsilon)
+        else:
+            test_path = 'test_non_targeted_adv_noise_{}/'.format(epsilon) 
+        os.makedirs(PATH + test_path)     
+        lstm_model.load_weights(PATH + 'vdp_lstm_model')       
+        test_no_steps = 0     
+        err_test = np.zeros(int(x_test.shape[0] /batch_size))
+        acc_test = np.zeros(int(x_test.shape[0] /batch_size))        
+        true_x = np.zeros([int(x_test.shape[0] /batch_size), batch_size, time_step, input_dim])
+        adv_perturbations = np.zeros([int(x_test.shape[0] /batch_size), batch_size, time_step, input_dim])
+        true_y = np.zeros([int(x_test.shape[0] /batch_size), batch_size, class_num])
+        mu_out_ = np.zeros([int(x_test.shape[0] /batch_size), batch_size, class_num])     
+        sigma_ = np.zeros([int(x_test.shape[0] / (batch_size)), batch_size, class_num, class_num])
+        adv_test_start = timeit.default_timer()
+        for step, (x, y) in enumerate(test_dataset):
+            update_progress(step / int(x_test.shape[0] / (batch_size)) ) 
+            if (x.shape[0] == batch_size):  
+                true_x[test_no_steps, :, :, :] = x.numpy()
+                true_y[test_no_steps, :, :] = y.numpy()            
+                if Targeted:
+                    y_true_batch = np.zeros_like(y)
+                    y_true_batch[:, adversary_target_cls] = 1.0            
+                    adv_perturbations[test_no_steps, :, :, :] = create_adversarial_pattern(x, y_true_batch)
+                else:
+                    adv_perturbations[test_no_steps, :, :, :] = create_adversarial_pattern(x, y)
+                adv_x = x + epsilon*adv_perturbations[test_no_steps, :, :, :] 
+                adv_x = tf.clip_by_value(adv_x, 0.0, 1.0)                
+                
+                tloss, mu_out, sigma, regularization_loss, vloss = valid_on_batch(adv_x, y)          
+                mu_out_[test_no_steps,:,:] = mu_out.numpy()   
+                sigma_[test_no_steps, :, :, :]= sigma.numpy()                      
+                corr = tf.equal(tf.math.argmax(mu_out, axis=1),tf.math.argmax(y,axis=1))
+                accuracy = tf.reduce_mean(tf.cast(corr,tf.float32))
+                acc_test[test_no_steps]=accuracy.numpy()              
+                err_test[test_no_steps] = tloss.numpy() 
+                  
+                if step % 50 == 0:
+                    print("Step:", step, "Loss:", float(tloss.numpy()))
+                    print("test accuracy: %.3f" % accuracy.numpy())             
+                test_no_steps+=1               
+        adv_test_stop = timeit.default_timer()
+        print('Total Test Time: ', adv_test_stop - adv_test_start)    
+        test_acc = np.mean(acc_test)         
+        test_error = np.mean(err_test) 
+        print('Test accuracy : ', test_acc)
+        print('Test error : ', test_error)                     
+        
+        pf = open(PATH + test_path + 'prediction_info.pkl', 'wb')                    
+        pickle.dump([mu_out_, true_y,sigma_, acc_test, err_test ], pf)                                                   
+        pf.close()
+        
+        snr_signal = np.zeros([int(x_test.shape[0]/(batch_size)) ,batch_size])
+        for i in range(int(x_test.shape[0]/batch_size)):
+            for j in range(batch_size):               
+                snr_signal[i,j] = 10*np.log10( np.sum(np.square(true_x[i,j,:, :]))/np.sum( np.square(true_x[i,j,:, :] - np.clip(true_x[i,j,:, :]+epsilon*adv_perturbations[i, j, :, :], 0.0, 1.0)  ) ))          
+        print('SNR', np.mean(snr_signal))        
+        
+#        writer = pd.ExcelWriter(PATH + test_path + 'Covarience_matrices.xlsx', engine='xlsxwriter')
+#        for i in range(int(x_test.shape[0]/batch_size)):
+#            for j in range(batch_size):  
+#                df = pd.DataFrame(sigma_[i,j,:,:])    
+#                # Write your DataFrame to a file   
+#                df.to_excel(writer, "Sheet", startrow=i*(class_num+4),  startcol=j*(class_num+6))
+#                # Save the result
+#                df1 = pd.DataFrame(mu_out_[i,j,:])
+#                df1.to_excel(writer, 'Sheet', startrow=i*(class_num+4),  startcol=(7 + j*(class_num+6)))
+#        writer.save() 
+        
+        pred_var = np.zeros(int(x_test.shape[0] ))   
+        true_var = np.zeros(int(x_test.shape[0] )) 
+        correct_classification = np.zeros(int(x_test.shape[0] )) 
+        misclassification_pred = np.zeros(int(x_test.shape[0] )) 
+        misclassification_true = np.zeros(int(x_test.shape[0] )) 
+        predicted_out = np.zeros(int(x_test.shape[0] )) 
+        true_out = np.zeros(int(x_test.shape[0] )) 
+        k=0   
+        k1=0
+        k2=0  
+        for i in range(int(x_test.shape[0] /batch_size)):
+            for j in range(batch_size):               
+                predicted_out[k] = np.argmax(mu_out_[i,j,:])
+                true_out[k] = np.argmax(true_y[i,j,:])
+                pred_var[k] = sigma_[i,j, int(predicted_out[k]), int(predicted_out[k])]    
+                true_var[k] = sigma_[i,j, int(true_out[k]), int(true_out[k])]  
+                if (predicted_out[k] == true_out[k]):
+                    correct_classification[k1] = sigma_[i,j, int(predicted_out[k]), int(predicted_out[k])] 
+                    k1=k1+1
+                if (predicted_out[k] != true_out[k]):
+                    misclassification_pred[k2] = sigma_[i,j, int(predicted_out[k]), int(predicted_out[k])] 
+                    misclassification_true[k2] = sigma_[i,j, int(true_out[k]), int(true_out[k])]   
+                    k2=k2+1                 
+                k=k+1            
+         
+        print('Average Output Variance', np.mean(pred_var))            
+        var1 = pred_var#np.reshape(var, int(x_test.shape[0]/(batch_size))* batch_size)  
+        #print(var1)              
+        writer = pd.ExcelWriter(PATH + test_path + 'variance.xlsx', engine='xlsxwriter')
+        df = pd.DataFrame(np.abs(var1) )   
+        # Write your DataFrame to a file   
+        df.to_excel(writer, "Sheet")      
+        
+        df1 = pd.DataFrame(predicted_out)
+        df1.to_excel(writer, 'Sheet',  startcol=4)
+        
+        df2 = pd.DataFrame(true_out)
+        df2.to_excel(writer, 'Sheet',  startcol=7)
+        
+        df3 = pd.DataFrame(correct_classification)
+        df3.to_excel(writer, 'Sheet',  startcol=10)  
+        
+        df4 = pd.DataFrame(misclassification_pred)
+        df4.to_excel(writer, 'Sheet',  startcol=13)
+        
+        df5 = pd.DataFrame(misclassification_true)
+        df5.to_excel(writer, 'Sheet',  startcol=16)      
+        writer.save()
+        
+        
+        textfile = open(PATH + test_path + 'Related_hyperparameters.txt','w')    
+        textfile.write(' Input Dimension : ' +str(input_dim))
+        textfile.write('\n No Hidden Nodes : ' +str(units))
+        textfile.write('\n Number of Classes : ' +str(class_num))
+        textfile.write('\n No of epochs : ' +str(epochs))         
+        textfile.write('\n time step : ' +str(time_step))   
+        textfile.write('\n batch size : ' +str(batch_size))
+        textfile.write('\n Initial Learning rate : ' + str(lr))
+        textfile.write('\n Ending Learning rate : ' +str(lr_end))   
+        textfile.write('\n KL term factor : ' +str(kl_factor))     
+        textfile.write("\n---------------------------------") 
+        textfile.write('\n Total test time in sec : ' +str(adv_test_stop - adv_test_start))           
+        textfile.write("\n Test Accuracy : "+ str( test_acc))
+        textfile.write("\n Test error : "+ str(test_error))    
+        textfile.write("\n Average Output Variance: "+ str(np.mean(var1)))                 
+        textfile.write("\n---------------------------------")
+        if Adversarial_noise:
+            if Targeted:
+                textfile.write('\n Adversarial attack: TARGETED')
+                textfile.write('\n The targeted attack class: ' + str(adversary_target_cls))
+            else:      
+                textfile.write('\n Adversarial attack: Non-TARGETED')
+            textfile.write('\n Adversarial Noise epsilon: '+ str(epsilon ))
+            textfile.write("\n SNR: "+ str(np.mean(snr_signal)))               
+        textfile.write("\n---------------------------------")    
+        textfile.close()          
+        
+    if(BIM_adversarial):
+        if Targeted:
+            test_path = 'test_BIM_targeted_adv_noise_{}_alpha{}_itr{}/'.format(epsilon, alpha, maxAdvStep)
+        else:
+            test_path = 'test_BIM_non_targeted_adv_noise_{}_alpha{}_itr{}/'.format(epsilon, alpha, maxAdvStep)  
+        os.makedirs(PATH + test_path)    
+            
+        lstm_model.load_weights(PATH + 'vdp_lstm_model')       
+        test_no_steps = 0     
+        err_test = np.zeros(int(x_test.shape[0] /batch_size))
+        acc_test = np.zeros(int(x_test.shape[0] /batch_size))        
+        true_x = np.zeros([int(x_test.shape[0] /batch_size), batch_size, time_step, input_dim])
+        adv_perturbations = np.zeros([int(x_test.shape[0] /batch_size), batch_size, time_step, input_dim])
+        true_y = np.zeros([int(x_test.shape[0] /batch_size), batch_size, class_num])
+        mu_out_ = np.zeros([int(x_test.shape[0] /batch_size), batch_size, class_num])     
+        sigma_ = np.zeros([int(x_test.shape[0] / (batch_size)), batch_size, class_num, class_num])
+        bim_adv_test_start = timeit.default_timer()
+        for step, (x, y) in enumerate(test_dataset):
+            update_progress(step / int(x_test.shape[0] / (batch_size)) ) 
+            if (x.shape[0] == batch_size):  
+                true_x[test_no_steps, :, :, :] = x.numpy()
+                true_y[test_no_steps, :, :] = y.numpy() 
+                adv_x = x
+                for advStep in range(maxAdvStep):           
+                    if Targeted:
+                        y_true_batch = np.zeros_like(y)
+                        y_true_batch[:, adversary_target_cls] = 1.0            
+                        adv_perturbations1 = create_adversarial_pattern(x, y_true_batch)
+                    else:
+                        adv_perturbations1 = create_adversarial_pattern(x, y)
+                    adv_x = adv_x + alpha *adv_perturbations1 
+                    adv_x = tf.clip_by_value(adv_x, x - epsilon, x + epsilon)
+                    adv_x = tf.clip_by_value(adv_x, 0.0, 1.0) 
+                                   
+                adv_perturbations[test_no_steps, :, :, :]= adv_x
+                tloss, mu_out, sigma, regularization_loss, vloss = valid_on_batch(adv_x, y)          
+                mu_out_[test_no_steps,:,:] = mu_out.numpy()   
+                sigma_[test_no_steps, :, :, :]= sigma.numpy()                      
+                corr = tf.equal(tf.math.argmax(mu_out, axis=1),tf.math.argmax(y,axis=1))
+                accuracy = tf.reduce_mean(tf.cast(corr,tf.float32))
+                acc_test[test_no_steps]=accuracy.numpy()              
+                err_test[test_no_steps] = tloss.numpy() 
+                  
+                if step % 50 == 0:
+                    print("Step:", step, "Loss:", float(tloss.numpy()))
+                    print("test accuracy: %.3f" % accuracy.numpy())             
+                test_no_steps+=1                               
+        bim_adv_test_stop = timeit.default_timer()
+        print('Total Test Time: ', bim_adv_test_stop - bim_adv_test_start)    
+        test_acc = np.mean(acc_test)         
+        test_error = np.mean(err_test) 
+        print('Test accuracy : ', test_acc)
+        print('Test error : ', test_error)                     
+        
+        pf = open(PATH + test_path + 'prediction_info.pkl', 'wb')                    
+        pickle.dump([mu_out_, true_y,sigma_, acc_test, err_test ], pf)                                                   
+        pf.close()
+        
+        snr_signal = np.zeros([int(x_test.shape[0]/(batch_size)) ,batch_size])
+        for i in range(int(x_test.shape[0]/batch_size)):
+            for j in range(batch_size):               
+                snr_signal[i,j] = 10*np.log10( np.sum(np.square(true_x[i,j,:, :]))/np.sum( np.square(true_x[i,j,:, :] - adv_perturbations[i, j, :, :]  ) ))         
+        print('SNR', np.mean(snr_signal)) 
+        
+        
+#        writer = pd.ExcelWriter(PATH + test_path + 'Covarience_matrices.xlsx', engine='xlsxwriter')
+#        for i in range(int(x_test.shape[0]/batch_size)):
+#            for j in range(batch_size):  
+#                df = pd.DataFrame(sigma_[i,j,:,:])    
+#                # Write your DataFrame to a file   
+#                df.to_excel(writer, "Sheet", startrow=i*(class_num+4),  startcol=j*(class_num+6))
+#                # Save the result
+#                df1 = pd.DataFrame(mu_out_[i,j,:])
+#                df1.to_excel(writer, 'Sheet', startrow=i*(class_num+4),  startcol=(7 + j*(class_num+6)))
+#        writer.save() 
+        
+        pred_var = np.zeros(int(x_test.shape[0] ))   
+        true_var = np.zeros(int(x_test.shape[0] )) 
+        correct_classification = np.zeros(int(x_test.shape[0] )) 
+        misclassification_pred = np.zeros(int(x_test.shape[0] )) 
+        misclassification_true = np.zeros(int(x_test.shape[0] )) 
+        predicted_out = np.zeros(int(x_test.shape[0] )) 
+        true_out = np.zeros(int(x_test.shape[0] )) 
+        k=0   
+        k1=0
+        k2=0  
+        for i in range(int(x_test.shape[0] /batch_size)):
+            for j in range(batch_size):               
+                predicted_out[k] = np.argmax(mu_out_[i,j,:])
+                true_out[k] = np.argmax(true_y[i,j,:])
+                pred_var[k] = sigma_[i,j, int(predicted_out[k]), int(predicted_out[k])]    
+                true_var[k] = sigma_[i,j, int(true_out[k]), int(true_out[k])]  
+                if (predicted_out[k] == true_out[k]):
+                    correct_classification[k1] = sigma_[i,j, int(predicted_out[k]), int(predicted_out[k])] 
+                    k1=k1+1
+                if (predicted_out[k] != true_out[k]):
+                    misclassification_pred[k2] = sigma_[i,j, int(predicted_out[k]), int(predicted_out[k])] 
+                    misclassification_true[k2] = sigma_[i,j, int(true_out[k]), int(true_out[k])]   
+                    k2=k2+1               
+                k=k+1            
+         
+        print('Average Output Variance', np.mean(pred_var))               
+        var1 = pred_var#np.reshape(var, int(x_test.shape[0]/(batch_size))* batch_size)  
+        #print(var1)              
+        writer = pd.ExcelWriter(PATH + test_path + 'variance.xlsx', engine='xlsxwriter')
+        df = pd.DataFrame(np.abs(var1) )   
+        # Write your DataFrame to a file   
+        df.to_excel(writer, "Sheet")      
+        
+        df1 = pd.DataFrame(predicted_out)
+        df1.to_excel(writer, 'Sheet',  startcol=2)
+        
+        df2 = pd.DataFrame(true_out)
+        df2.to_excel(writer, 'Sheet',  startcol=5)
+        
+        df3 = pd.DataFrame(correct_classification)
+        df3.to_excel(writer, 'Sheet',  startcol=7)  
+        
+        df4 = pd.DataFrame(misclassification_pred)
+        df4.to_excel(writer, 'Sheet',  startcol=10)
+        
+        df5 = pd.DataFrame(misclassification_true)
+        df5.to_excel(writer, 'Sheet',  startcol=13)      
+        writer.save()        
+        
+        textfile = open(PATH + test_path + 'Related_hyperparameters.txt','w')    
+        textfile.write(' Input Dimension : ' +str(input_dim))
+        textfile.write('\n No Hidden Nodes : ' +str(units))
+        textfile.write('\n Number of Classes : ' +str(class_num))
+        textfile.write('\n No of epochs : ' +str(epochs))         
+        textfile.write('\n time step : ' +str(time_step))   
+        textfile.write('\n batch size : ' +str(batch_size))
+        textfile.write('\n Initial Learning rate : ' + str(lr))
+        textfile.write('\n Ending Learning rate : ' +str(lr_end))   
+        textfile.write('\n KL term factor : ' +str(kl_factor))     
+        textfile.write("\n---------------------------------") 
+        textfile.write('\n Total test time in sec : ' +str(bim_adv_test_stop - bim_adv_test_start))           
+        textfile.write("\n Test Accuracy : "+ str( test_acc))
+        textfile.write("\n Test error : "+ str(test_error))    
+        textfile.write("\n Average Output Variance: "+ str(np.mean(var1)))                 
+        textfile.write("\n---------------------------------")
+        if BIM_adversarial:
+            if Targeted:
+                textfile.write('\n BIM Adversarial attack: TARGETED')
+                textfile.write('\n The targeted attack class: ' + str(adversary_target_cls))
+            else:      
+                textfile.write('\n BIM Adversarial attack: Non-TARGETED')
+            textfile.write('\n Adversarial Noise epsilon: '+ str(epsilon ))
+            textfile.write("\n Alpha: "+ str(alpha)) 
+            textfile.write("\n Maximum number of iterations: "+ str(maxAdvStep)) 
+            textfile.write("\n SNR: "+ str(np.mean(snr_signal)))               
+        textfile.write("\n---------------------------------")    
+        textfile.close()            
+
+if __name__ == '__main__':
+    main_function()
