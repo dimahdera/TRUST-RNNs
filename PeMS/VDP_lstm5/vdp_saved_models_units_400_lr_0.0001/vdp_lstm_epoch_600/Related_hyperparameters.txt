@@ -1,0 +1,17 @@
+ Input Dimension : 963
+ No Hidden Nodes : 400
+ Number of Classes : 7
+ No of epochs : 600
+ time step : 144
+ Initial Learning rate : 0.0001
+ Ending Learning rate : 1e-06
+ batch size : 10
+ KL term factor : 0.0001
+---------------------------------
+ Total run time in sec : 36268.91621534061
+ Averaged Training  Accuracy : 0.89
+ Averaged Validation Accuracy : 0.8776470574210671
+ Averaged Training  error : -32.22627933208759
+ Averaged Validation error : -32.226078033447266
+---------------------------------
+---------------------------------
