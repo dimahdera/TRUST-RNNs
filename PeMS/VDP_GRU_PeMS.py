@@ -15,7 +15,7 @@ import timeit
 import datetime 
 import matplotlib as mpl
 import wandb
-os.environ["WANDB_API_KEY"] = "9deddc5ad75843b983c3f21d0a5ace861e19133a"
+os.environ["WANDB_API_KEY"] = ""
 import xlsxwriter
 import pandas as pd
 plt.ioff()
