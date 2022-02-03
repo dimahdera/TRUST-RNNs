@@ -839,6 +839,8 @@ def main_function(time_step=144, input_dim=963, units=400, class_num=7 , batch_s
         textfile.write("\n Average Output Variance: "+ str(np.mean(var1)))                 
         textfile.write("\n---------------------------------")
         if Adversarial_noise:
+            textfile.write("\n Correct Classification Variance: "+ str(np.mean(correct_classification)))  
+            textfile.write("\n MisClassification Variance: "+ str(np.mean(misclassification_pred)))  
             if Targeted:
                 textfile.write('\n Adversarial attack: TARGETED')
                 textfile.write('\n The targeted attack class: ' + str(adversary_target_cls))
