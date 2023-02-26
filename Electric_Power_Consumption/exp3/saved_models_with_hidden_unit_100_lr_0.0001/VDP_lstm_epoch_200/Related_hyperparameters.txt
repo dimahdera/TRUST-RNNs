@@ -1,0 +1,17 @@
+ Input Dimension : 7
+ No Hidden Nodes : 100
+ Output Size : 1
+ No of epochs : 200
+ time step : 1
+ batch size : 14
+ Initial Learning rate : 0.0001
+ Ending Learning rate : 1e-05
+ KL term factor : 0.0001
+---------------------------------
+ Total run time in sec : 29966.188183980063
+ Training  RMSE : 0.5702401888971086
+ Validation RMSE : 0.5062867493618399
+ Training  Loss : -1.990263475486974
+ Validation Loss : -2.0505942721391004
+---------------------------------
+---------------------------------
