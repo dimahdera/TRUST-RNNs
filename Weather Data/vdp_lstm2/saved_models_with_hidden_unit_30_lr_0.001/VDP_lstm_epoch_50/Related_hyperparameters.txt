@@ -1,0 +1,16 @@
+ Input Sequence Length : 24 Input Dimension : 19
+ No Hidden Nodes : 30
+ Output Size : 1
+ No of epochs : 50
+ Learning rate : 0.001
+ time step : 24
+ batch size : 200
+ KL term factor : 0.001
+---------------------------------
+ Total run time in sec : 4493.285098244902
+ Training  MAE : 0.013747393311362486
+ Validation MAE : 0.013713338073076946
+ Training  Loss : -2.082154557656269
+ Validation Loss : -2.150557928425925
+---------------------------------
+---------------------------------

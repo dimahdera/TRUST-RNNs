@@ -1,0 +1,18 @@
+ Input Dimension : 19
+ No Hidden Nodes : 30
+ Output Size : 1
+ No of epochs : 50
+ Initial Learning rate : 0.001
+ Ending Learning rate : 1e-06
+ time step : 24
+ batch size : 200
+ KL term factor : 0.001
+---------------------------------
+ Total test time in sec : 7.457833311986178
+ Average Test MAE : 0.11542048124330384
+ Average Test RMSE : 0.1443102470466069
+ Output Variance: 0.01361628693543441
+---------------------------------
+ Random Noise std: 0.5
+ SNR: 0.07329802563722157
+---------------------------------
